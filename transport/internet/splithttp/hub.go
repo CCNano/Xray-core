@@ -19,6 +19,8 @@ import (
 	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/stat"
 	v2tls "github.com/xtls/xray-core/transport/internet/tls"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/h2c"
 )
 
 type requestHandler struct {
@@ -159,6 +161,9 @@ func (h *requestHandler) ServeHTTP(writer http.ResponseWriter, request *http.Req
 
 		// magic header instructs nginx + apache to not buffer response body
 		writer.Header().Set("X-Accel-Buffering", "no")
+		// magic header to make the HTTP middle box consider this as SSE to disable buffer
+		writer.Header().Set("Content-Type", "text/event-stream")
+		
 		writer.WriteHeader(http.StatusOK)
 		// send a chunk immediately to enable CDN streaming.
 		// many CDN buffer the response headers until the origin starts sending
@@ -268,16 +273,21 @@ func ListenSH(ctx context.Context, address net.Address, port net.Port, streamSet
 		}
 	}
 
+	handler := &requestHandler{
+		host:      shSettings.Host,
+		path:      shSettings.GetNormalizedPath(),
+		ln:        l,
+		sessions:  sync.Map{},
+		localAddr: localAddr,
+	}
+
+	// h2cHandler can handle both plaintext HTTP/1.1 and h2c
+	h2cHandler := h2c.NewHandler(handler, &http2.Server{})
+
 	l.listener = listener
 
 	l.server = http.Server{
-		Handler: &requestHandler{
-			host:      shSettings.Host,
-			path:      shSettings.GetNormalizedPath(),
-			ln:        l,
-			sessions:  sync.Map{},
-			localAddr: localAddr,
-		},
+		Handler:           h2cHandler,
 		ReadHeaderTimeout: time.Second * 4,
 		MaxHeaderBytes:    8192,
 	}
