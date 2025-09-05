@@ -392,7 +392,7 @@ func (s *Instance) Start() error {
 		}
 	}
 
-	errors.LogWarning(s.ctx, "Xray ", Version(), " started")
+	errors.LogWarning(s.ctx, "Nanox ", Version(), " started")
 
 	return nil
 }
