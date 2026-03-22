@@ -18,12 +18,13 @@ import (
 	"github.com/apernet/quic-go/http3"
 	goreality "github.com/xtls/reality"
 	"github.com/xtls/xray-core/common"
+	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
-	"github.com/xtls/xray-core/transport/internet/hysteria/congestion"
 	http_proto "github.com/xtls/xray-core/common/protocol/http"
 	"github.com/xtls/xray-core/common/signal/done"
 	"github.com/xtls/xray-core/transport/internet"
+	"github.com/xtls/xray-core/transport/internet/hysteria/congestion"
 	"github.com/xtls/xray-core/transport/internet/reality"
 	"github.com/xtls/xray-core/transport/internet/stat"
 	"github.com/xtls/xray-core/transport/internet/tls"
@@ -254,7 +255,7 @@ func (h *requestHandler) ServeHTTP(writer http.ResponseWriter, request *http.Req
 		dataPlacement := h.config.GetNormalizedUplinkDataPlacement()
 		var headerPayload []byte
 		if dataPlacement == PlacementAuto || dataPlacement == PlacementHeader {
-			var headerPayloadChunks [] string
+			var headerPayloadChunks []string
 			for i := 0; true; i++ {
 				chunk := request.Header.Get(fmt.Sprintf("%s-%d", uplinkDataKey, i))
 				if chunk == "" {
@@ -293,15 +294,36 @@ func (h *requestHandler) ServeHTTP(writer http.ResponseWriter, request *http.Req
 
 		var bodyPayload []byte
 		if dataPlacement == PlacementAuto || dataPlacement == PlacementBody {
-			bodyPayload, err = io.ReadAll(io.LimitReader(request.Body, int64(scMaxEachPostBytes)+1))
-			if err != nil {
-				errors.LogInfoInner(context.Background(), err, "failed to upload (ReadAll)")
-				writer.WriteHeader(http.StatusInternalServerError)
+			var readErr error
+			if request.ContentLength > int64(scMaxEachPostBytes) {
+				errors.LogInfo(context.Background(), "Too large upload. scMaxEachPostBytes is set to ", scMaxEachPostBytes, "but request size exceed it. Adjust scMaxEachPostBytes on the server to be at least as large as client.")
+				writer.WriteHeader(http.StatusRequestEntityTooLarge)
+				return
+			}
+			if request.ContentLength > 0 {
+				bodyPayload = make([]byte, request.ContentLength)
+				_, readErr = io.ReadFull(request.Body, bodyPayload)
+			} else {
+				bodyPayload, readErr = buf.ReadAllToBytes(io.LimitReader(request.Body, int64(scMaxEachPostBytes)+1))
+			}
+			if readErr != nil {
+				errors.LogInfoInner(context.Background(), readErr, "failed to read body payload")
+				writer.WriteHeader(http.StatusBadRequest)
 				return
 			}
 		}
 
-		payload := slices.Concat(headerPayload, cookiePayload, bodyPayload)
+		var payload []byte
+		switch dataPlacement {
+		case PlacementHeader:
+			payload = headerPayload
+		case PlacementCookie:
+			payload = cookiePayload
+		case PlacementBody:
+			payload = bodyPayload
+		case PlacementAuto:
+			payload = slices.Concat(headerPayload, cookiePayload, bodyPayload)
+		}
 
 		if len(payload) > scMaxEachPostBytes {
 			errors.LogInfo(context.Background(), "Too large upload. scMaxEachPostBytes is set to ", scMaxEachPostBytes, "but request size exceed it. Adjust scMaxEachPostBytes on the server to be at least as large as client.")
@@ -463,7 +485,6 @@ func ListenXH(ctx context.Context, address net.Address, port net.Port, streamSet
 		if err != nil {
 			return nil, errors.New("failed to listen UDP for XHTTP/3 on ", address, ":", port).Base(err)
 		}
-
 		if streamSettings.UdpmaskManager != nil {
 			pktConn, err := streamSettings.UdpmaskManager.WrapPacketConnServer(Conn)
 			if err != nil {
@@ -473,7 +494,22 @@ func ListenXH(ctx context.Context, address net.Address, port net.Port, streamSet
 			Conn = pktConn
 		}
 
-		l.h3listener, err = quic.ListenEarly(Conn, tlsConfig, nil)
+		quicParams := streamSettings.QuicParams
+		if quicParams == nil {
+			quicParams = &internet.QuicParams{}
+		}
+
+		quicConfig := &quic.Config{
+			InitialStreamReceiveWindow:     quicParams.InitStreamReceiveWindow,
+			MaxStreamReceiveWindow:         quicParams.MaxStreamReceiveWindow,
+			InitialConnectionReceiveWindow: quicParams.InitConnReceiveWindow,
+			MaxConnectionReceiveWindow:     quicParams.MaxConnReceiveWindow,
+			MaxIdleTimeout:                 time.Duration(quicParams.MaxIdleTimeout) * time.Second,
+			MaxIncomingStreams:             quicParams.MaxIncomingStreams,
+			DisablePathMTUDiscovery:        quicParams.DisablePathMtuDiscovery,
+		}
+
+		l.h3listener, err = quic.ListenEarly(Conn, tlsConfig, quicConfig)
 		if err != nil {
 			return nil, errors.New("failed to listen QUIC for XHTTP/3 on ", address, ":", port).Base(err)
 		}
@@ -491,22 +527,23 @@ func ListenXH(ctx context.Context, address net.Address, port net.Port, streamSet
 					errors.LogInfoInner(ctx, err, "XHTTP/3 listener closed")
 					return
 				}
-				if streamSettings.QuicParams != nil {
-					switch streamSettings.QuicParams.Congestion {
-					case "force-brutal":
-						congestion.UseBrutal(conn, streamSettings.QuicParams.Up)
-					case "reno":
-						// quic-go default, do nothing
-					default:
-						congestion.UseBBR(conn)
-					}
-				} else {
+
+				switch quicParams.Congestion {
+				case "force-brutal":
+					errors.LogDebug(context.Background(), conn.RemoteAddr(), " ", "congestion brutal bytes per second ", quicParams.BrutalUp)
+					congestion.UseBrutal(conn, quicParams.BrutalUp)
+				case "reno":
+					errors.LogDebug(context.Background(), conn.RemoteAddr(), " ", "congestion reno")
+				default:
+					errors.LogDebug(context.Background(), conn.RemoteAddr(), " ", "congestion bbr")
 					congestion.UseBBR(conn)
 				}
+
 				go func() {
 					if err := l.h3server.ServeQUICConn(conn); err != nil {
 						errors.LogDebugInner(ctx, err, "XHTTP/3 connection ended")
 					}
+					_ = conn.CloseWithError(0, "")
 				}()
 			}
 		}()
@@ -573,6 +610,7 @@ func (ln *Listener) Addr() net.Addr {
 func (ln *Listener) Close() error {
 	if ln.h3server != nil {
 		if err := ln.h3server.Close(); err != nil {
+			_ = ln.h3listener.Close()
 			return err
 		}
 		return ln.h3listener.Close()
